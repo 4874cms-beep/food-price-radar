@@ -25,17 +25,31 @@ def secret(name: str, default=None):
 
 # ---------------- 데이터 ----------------
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def read_csv_data() -> pd.DataFrame:
+    return A.load_prices(DATA_PATH)
+
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def collect_from_kamis(key: str, cid: str, years: int) -> pd.DataFrame:
+    """서버에서 직접 수집 (진행 상황은 Manage app 로그에 출력). 실패하면 캐시되지 않음."""
+    import kamis
+
+    df = kamis.collect(key, cid, years=years, log=lambda m: print(m, flush=True))
+    df["date"] = pd.to_datetime(df["date"])
+    try:  # 같은 서버가 살아 있는 동안 재수집하지 않도록 저장
+        df.to_csv(DATA_PATH, index=False, encoding="utf-8-sig")
+    except Exception:
+        pass
+    return A.load_prices(DATA_PATH) if DATA_PATH.exists() else df
+
+
 def load_data() -> pd.DataFrame | None:
     if DATA_PATH.exists():
-        return A.load_prices(DATA_PATH)
+        return read_csv_data()
     key, cid = secret("KAMIS_CERT_KEY"), secret("KAMIS_CERT_ID")
-    if key and cid:  # CSV가 없으면 서버에서 직접 수집 (첫 접속 시 1~3분)
-        import kamis
-
-        df = kamis.collect(key, cid, years=int(secret("KAMIS_YEARS", 3)), log=lambda *_: None)
-        df["date"] = pd.to_datetime(df["date"])
-        return df
-    return None
+    if key and cid:
+        return collect_from_kamis(str(key), str(cid), int(secret("KAMIS_YEARS", 3)))
+    return None  # 캐시하지 않음 → 키를 넣으면 바로 반영
 
 
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
@@ -66,6 +80,34 @@ def ai(prompt: str, facts: str, use_cache: bool = True) -> str:
     return cached_ask(prompt, facts) if use_cache else get_llm().ask(prompt, facts)
 
 
+@st.cache_data(show_spinner=False)
+def demo_data() -> pd.DataFrame:
+    """화면·AI 기능 점검용 가짜 데이터 (실제 가격 아님)."""
+    import numpy as np
+
+    rng = np.random.default_rng(42)
+    dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=260 * 4)
+    spec = [  # 품목, 기준가, 가장 싼 달, 단위, 출하 안 되는 달
+        ("배추", 4000, 3, "1포기", []), ("무", 2500, 4, "1개", []),
+        ("양파", 2600, 6, "1kg", []), ("대파", 3000, 5, "1kg", []),
+        ("사과", 25000, 10, "10개", []), ("딸기", 15000, 3, "100g", [6, 7, 8, 9, 10]),
+        ("고등어", 4000, 11, "1마리", []), ("꽃게", 30000, 9, "1kg", []),
+    ]
+    rows = []
+    for item, base, low, unit, off in spec:
+        for d in dates:
+            if d.month in off:
+                continue
+            season = 1 - 0.25 * np.cos(2 * np.pi * (d.month - low) / 12)
+            p = base * season * (1.03 ** (d.year - dates[0].year)) * rng.normal(1, 0.05)
+            rows.append((d, item, "데모", "", "상품", unit, float(round(p))))
+    df = pd.DataFrame(rows, columns=["date", "item", "category", "kind", "rank", "unit", "price"])
+    # 몇 품목은 최근 가격을 일부러 낮춰서 '저렴이'가 보이게
+    recent = df["date"] > df["date"].max() - pd.Timedelta(days=21)
+    df.loc[recent & df["item"].isin(["배추", "고등어", "꽃게"]), "price"] *= 0.75
+    return df
+
+
 def pct(x) -> str:
     return "–" if x != x else f"{x * 100:+.0f}%"
 
@@ -74,24 +116,36 @@ def pct(x) -> str:
 st.title("🛒 Food Price Radar · 저렴이 레이더")
 st.caption("공공 가격 데이터(KAMIS)로 식재료가 **해마다 반복해서 싸지는 시기**를 찾고, 생성형 AI(Gemini)가 장보기 타이밍을 설명해 주는 서비스")
 
-with st.spinner("가격 데이터를 불러오는 중... (처음 접속이면 1~3분 걸릴 수 있어요)"):
+with st.spinner("가격 데이터를 불러오는 중... (처음 수집이면 5~10분 걸릴 수 있어요. 진행 상황은 Manage app 로그에서 볼 수 있어요)"):
     try:
         df = load_data()
     except Exception as e:
         df = None
         st.error(f"데이터 수집 중 오류: {e}")
 
+DEMO = False
 if df is None or df.empty:
-    st.warning(
-        "아직 가격 데이터가 없어요.\n\n"
-        "- 방법 1: 로컬에서 `python kamis.py --years 5` 실행 후 `prices.csv`를 GitHub에 올리기\n"
-        "- 방법 2: Streamlit secrets에 `KAMIS_CERT_KEY`, `KAMIS_CERT_ID` 넣기 (서버가 직접 수집)"
-    )
-    st.stop()
+    if st.session_state.get("demo"):
+        df, DEMO = demo_data(), True
+    else:
+        st.warning(
+            "아직 가격 데이터가 없어요.\n\n"
+            "- 방법 1: 로컬에서 `python kamis.py --years 5` 실행 후 `prices.csv`를 GitHub에 올리기\n"
+            "- 방법 2: Streamlit secrets에 `KAMIS_CERT_KEY`, `KAMIS_CERT_ID` 넣기 (서버가 직접 수집)"
+        )
+        if st.button("🧪 가짜 데이터로 미리보기"):
+            st.session_state["demo"] = True
+            st.rerun()
+        st.stop()
+
+if DEMO:
+    st.error("🧪 **데모 모드**: 지금 보이는 가격은 화면 점검용 **가짜 데이터**예요. 실제 KAMIS 가격이 아닙니다.")
 
 llm = get_llm()
 radar = cached_radar(df)
 facts = cached_facts(df)
+if DEMO:
+    facts = "[주의: 아래는 기능 점검용 가짜 데모 데이터이며 실제 가격이 아님. 답변 첫 줄에 '(데모 데이터 기준)'이라고 밝힐 것]\n" + facts
 asof = df["date"].max().date()
 
 with st.sidebar:

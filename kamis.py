@@ -67,12 +67,12 @@ TARGETS = [
 ]
 
 
-def _get(params: dict, cert_key: str, cert_id: str, retries: int = 3) -> dict:
+def _get(params: dict, cert_key: str, cert_id: str, retries: int = 2) -> dict:
     q = {**params, "p_cert_key": cert_key, "p_cert_id": cert_id, "p_returntype": "json"}
     last_err = None
     for i in range(retries):
         try:
-            r = requests.get(BASE_URL, params=q, timeout=30)
+            r = requests.get(BASE_URL, params=q, timeout=15)
             r.raise_for_status()
             return r.json()
         except Exception as e:  # 네트워크/JSON 오류는 잠시 쉬고 재시도
@@ -232,10 +232,18 @@ def fetch_history(t: dict, start: dt.date, end: dt.date, cert_key: str, cert_id:
 def collect(cert_key: str, cert_id: str, years: int = 5, log=print) -> pd.DataFrame:
     today = dt.date.today()
     ref_dates = [today - dt.timedelta(days=30 * k) for k in (0, 3, 6, 9)]
+    log("⓪ KAMIS 연결 확인 중...")
+    try:
+        _get({"action": "dailyPriceByCategoryList", "p_product_cls_code": "01",
+              "p_item_category_code": "200", "p_country_code": "", "p_regday": today.isoformat(),
+              "p_convert_kg_yn": "N"}, cert_key, cert_id, retries=1)
+    except Exception as e:
+        raise RuntimeError(f"KAMIS 서버에 연결하지 못했어요 (해외 서버 차단 가능성). PC에서 수집해 주세요. [{e}]")
     log("① 품목 코드표 받는 중...")
     catalog = fetch_catalog(cert_key, cert_id, ref_dates)
     if catalog.empty:
         raise RuntimeError("코드표가 비어 있어요. 인증키(cert_key)와 아이디(cert_id)를 확인해 주세요.")
+    log(f"   코드표 {len(catalog)}행")
     targets = pick_targets(catalog)
     start = dt.date(today.year - years, 1, 1)
     frames = []
